@@ -306,21 +306,20 @@ def discover_leases(districts, patterns, output_file, state_file=None, clear_his
                 # Rate limiting
                 time.sleep(1)
         
-        # Save discovered leases
-        if all_leases:
-            log.info(f'Saving {len(all_leases)} unique leases to {output_file}')
-            with open(output_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['lease_number', 'district', 'name', 'well_type'])
-                for lease in sorted(all_leases.values(), key=lambda x: (x['district'], x['lease_number'])):
-                    writer.writerow([
-                        lease['lease_number'],
-                        lease['district'],
-                        lease['name'],
-                        lease['well_type']
-                    ])
-        else:
-            log.warning('No leases discovered')
+        # Save discovered leases (always write, even if empty)
+        log.info(f'Saving {len(all_leases)} unique leases to {output_file}')
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['lease_number', 'district', 'name', 'well_type'])
+            for lease in sorted(all_leases.values(), key=lambda x: (x['district'], x['lease_number'])):
+                writer.writerow([
+                    lease['lease_number'],
+                    lease['district'],
+                    lease['name'],
+                    lease['well_type']
+                ])
+        if not all_leases:
+            log.info('No new leases found for this run (output file written with headers only)')
         
         return len(all_leases)
         

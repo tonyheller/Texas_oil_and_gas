@@ -84,6 +84,30 @@ echo ""
 # Run discovery per-district so partial results survive interruption
 for DIST in $(echo "$DISTRICTS" | tr ',' ' '); do
     DIST_OUT="./leases_district_${DIST}.csv"
+
+    # Check if this district's patterns are already all done in state file
+    DIST_PENDING=""
+    if [ -f "$STATE_FILE" ] && [ "$CLEAR_HISTORY" = "" ]; then
+        DIST_PENDING=$(python3 -c "
+import json, sys
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+done = set(state.get('$DIST', []))
+all_patterns = '''$PATTERNS'''.replace('\\\\', '').replace('\n', '').split(',')
+pending = [p for p in all_patterns if p not in done]
+print(len(pending))
+" 2>/dev/null || echo "unknown")
+    else
+        DIST_PENDING="all"
+    fi
+
+    if [ "$DIST_PENDING" = "0" ] && [ -f "$DIST_OUT" ]; then
+        COUNT=$(tail -n +2 "$DIST_OUT" | wc -l)
+        echo "[$(date)] District $DIST already complete: $COUNT leases (skipping)" | tee -a "$LOGFILE"
+        echo ""
+        continue
+    fi
+
     echo "[$(date)] Starting district $DIST → $DIST_OUT" | tee -a "$LOGFILE"
 
     python3 lease_discovery.py \
