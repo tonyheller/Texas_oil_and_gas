@@ -1,2 +1,18 @@
+# Byte-compiled / optimized
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
 *.swp
-__pycache__
+*.swo
+
+# Generated data (do not commit)
+data/
+*.log
+leases_district_*.csv
+leases_discovered.csv
+test_leases.csv
+download_state.json
+discovery_state.json
+texas_production_data.csv
