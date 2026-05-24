@@ -117,14 +117,24 @@ def search_leases(driver, district, pattern):
     Returns a list of dicts with lease info.
     """
     leases = []
-    
+
     try:
         # Navigate to lease search
         driver.get(f'{PDQ_BASE}/PDQ/leaseSearchAction.do')
         time.sleep(2)
-        
-        # Select district
-        district_select = Select(driver.find_element(By.NAME, 'district'))
+
+        # Check for session timeout BEFORE interacting with form elements
+        if 'Session Timed Out' in driver.page_source:
+            log.warning('Session timed out on initial page load')
+            return None  # Signal to recreate driver
+
+        # Select district (this will fail if page didn't load properly)
+        try:
+            district_select = Select(driver.find_element(By.NAME, 'district'))
+        except Exception:
+            log.warning('Could not find district select — page may not have loaded')
+            return None
+
         district_value = DISTRICT_MAP.get(district, district)
         district_select.select_by_value(district_value)
         
@@ -202,9 +212,9 @@ def search_leases(driver, district, pattern):
         
         log.info(f'Found {len(leases)} leases for {district}/{pattern}')
         return leases
-        
+
     except Exception as e:
-        log.error(f'Error searching {district}/{pattern}: {e}')
+        log.warning(f'Error searching {district}/{pattern}: {e} (will retry)')
         return None
 
 
