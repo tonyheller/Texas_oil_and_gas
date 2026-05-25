@@ -322,6 +322,7 @@ def lookup_lat_lon_from_gis_viewer(driver, api_id):
     try:
         log.info(f'GIS Viewer: requesting lat/lon for API {api_id}')
         driver.get(url)
+        log.info(f'GIS Viewer: URL={driver.current_url}')
         log.info(f'GIS Viewer: page loaded for API {api_id}, waiting for JS render...')
         time.sleep(5)
 
@@ -391,7 +392,7 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
         # Step 1: Search by lease number + district in Wellbore Query
         log.info(f'Operator step 1: navigating to EWA Wellbore Query...')
         driver.get(EWA_WELLBORE_URL)
-        log.info(f'Operator step 1: page loaded (title: {driver.title}), filling form...')
+        log.info(f'Operator step 1: URL={driver.current_url} (title: {driver.title}), filling form...')
         time.sleep(2)
 
         # Check for session timeout or login redirect
@@ -415,7 +416,7 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
         log.info(f'Operator step 1: submitting query for lease {lease_number}...')
         driver.find_element(By.CSS_SELECTOR, 'input[type="submit"]').click()
         time.sleep(3)
-        log.info(f'Operator step 1: results page loaded (title: {driver.title})')
+        log.info(f'Operator step 1: results URL={driver.current_url} (title: {driver.title})')
 
         # Check results
         if 'No results found' in driver.page_source:
@@ -446,7 +447,7 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
         api_link = driver.find_element(By.LINK_TEXT, api_id)
         api_link.click()
         time.sleep(4)
-        log.info(f'Operator step 2: lease detail page loaded (title: {driver.title})')
+        log.info(f'Operator step 2: URL={driver.current_url} (title: {driver.title})')
 
         detail_source = driver.page_source
 
@@ -529,12 +530,13 @@ def _extract_county(driver, production_source):
         # Find and click County Production link
         county_links = driver.find_elements(By.LINK_TEXT, 'County Production')
         if not county_links:
-            log.info(f'County lookup: no County Production link found')
+            log.info(f'County lookup: no County Production link found, URL={driver.current_url}')
             return None
 
         county_links[0].click()
         log.info(f'County lookup: navigating to county view...')
         time.sleep(3)
+        log.info(f'County lookup: county view URL={driver.current_url}')
 
         county_source = driver.page_source
 
@@ -588,9 +590,9 @@ def extract_production_data(driver, state=None, lease_key=None):
         if view_all_links:
             view_all_links[0].click()
             time.sleep(3)
-            log.info(f'Extract: clicked "View All Results"')
+            log.info(f'Extract: clicked "View All Results" — URL={driver.current_url}')
         else:
-            log.info(f'Extract: no "View All Results" link found (data may already be visible)')
+            log.info(f'Extract: no "View All Results" link found, URL={driver.current_url}')
 
         # Get page source
         source = driver.page_source
@@ -782,7 +784,7 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
         # Navigate to Specific Lease Query
         log.info(f'PDQ: navigating to lease query form...')
         driver.get(f'{PDQ_BASE}/PDQ/quickLeaseReportBuilderAction.do')
-        log.info(f'PDQ: form page loaded (title: {driver.title})')
+        log.info(f'PDQ: URL={driver.current_url} (title: {driver.title})')
         time.sleep(2)
 
         # Check for session timeout
@@ -815,8 +817,9 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
         log.info(f'PDQ: submitting query for lease {lease_number} (district {district}, {well_type}, {effective_start}-{effective_end})...')
         submit_btn = driver.find_element(By.XPATH, '//input[@type="submit" and @value="Submit"]')
         submit_btn.click()
-        
+
         time.sleep(4)
+        log.info(f'PDQ: results URL={driver.current_url} (title: {driver.title})')
 
         # Handle alerts
         try:
