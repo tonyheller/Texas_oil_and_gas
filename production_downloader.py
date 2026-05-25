@@ -18,7 +18,10 @@ import logging.handlers
 import os
 import re
 import sqlite3
+import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
@@ -175,12 +178,45 @@ _MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
 _MONTH_BITS = {name: i for i, name in enumerate(_MONTH_NAMES)}
 
 
+class ThreadSafeCSVWriter:
+    """Thread-safe CSV writer with lock-protected appends."""
+
+    def __init__(self, output_file, fieldnames):
+        self.output_file = Path(output_file)
+        self.fieldnames = fieldnames
+        self._lock = threading.Lock()
+        self._write_header()
+
+    def _write_header(self):
+        with self._lock:
+            if not self.output_file.exists():
+                with open(self.output_file, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writeheader()
+            elif self.output_file.stat().st_size == 0:
+                with open(self.output_file, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writeheader()
+
+    def write_rows(self, records):
+        """Append records to CSV (thread-safe)."""
+        if not records:
+            return
+        with self._lock:
+            with open(self.output_file, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writerows(records)
+
+
 class DownloadState:
     """SQLite-backed state tracking for production downloads.
 
     Uses integer bitmasks for month tracking (12 months per year = one int)
     and a separate metadata table. WAL journaling enables fast writes
     without full-file rewrites. Scales to millions of leases.
+
+    Each thread should use its own DownloadState instance (pointing to the
+    same .db file). WAL mode handles concurrent access safely.
     """
 
     def __init__(self, state_file):
@@ -188,9 +224,11 @@ class DownloadState:
         # If the user pointed to a .json file, redirect to .db
         if self.db_path.suffix == '.json':
             self.db_path = self.db_path.with_suffix('.db')
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), isolation_level=None)
         self._conn.execute('PRAGMA journal_mode=WAL')
         self._conn.execute('PRAGMA synchronous=NORMAL')
+        self._conn.execute('PRAGMA busy_timeout=5000')
         self._create_tables()
         self._maybe_migrate_legacy_json(state_file)
 
@@ -1129,97 +1167,146 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
         return None
 
 
-def save_records(records, output_file):
-    """Save production records to CSV file."""
-    if not records:
-        return
-    
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    fieldnames = [
-        'api_number', 'lease_number', 'lease_name', 'well_number',
-        'district', 'county', 'latitude', 'longitude', 'well_type',
-        'operator', 'operator_no', 'field', 'field_no',
-        'date', 'month', 'year',
-        'gas_production', 'gas_disposition',
-        'oil_condensate_production', 'oil_condensate_disposition'
-    ]
-    
-    file_exists = output_path.exists()
-    
-    with open(output_path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(records)
-    
-    log.info(f'Saved {len(records)} records to {output_file}')
+FIELD_NAMES = [
+    'api_number', 'lease_number', 'lease_name', 'well_number',
+    'district', 'county', 'latitude', 'longitude', 'well_type',
+    'operator', 'operator_no', 'field', 'field_no',
+    'date', 'month', 'year',
+    'gas_production', 'gas_disposition',
+    'oil_condensate_production', 'oil_condensate_disposition'
+]
+
+# Global CSV writer shared across threads (created in download_all)
+_csv_writer = None
 
 
-def download_all(leases, start_year, end_year, output_dir, state=None):
-    """Download production data for all leases across all years."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+def _worker(lease, start_year, end_year, db_path):
+    """
+    Download production data for a single lease.
 
-    output_file = output_path / 'texas_production_data.csv'
+    Each worker gets its own browser driver and its own SQLite connection
+    (pointing to the same .db file). WAL mode handles concurrent access.
 
-    # Don't remove existing file - we append incrementally
-    # (state tracking prevents duplicate downloads)
+    Returns (records, status) where status is 'ok', 'empty', 'skip', or 'error'.
+    """
+    lease_num = lease['lease_number']
+    district = lease['district']
+    well_type = lease['well_type']
+    lease_key = f'{district}/{lease_num}'
 
-    driver = create_driver()
-    total_records = 0
-    skipped_count = 0
-
+    driver = None
+    state = None
     try:
-        total_leases = len(leases)
+        driver = create_driver()
+        state = DownloadState(str(db_path))
 
-        for i, lease in enumerate(leases, 1):
-            lease_num = lease['lease_number']
-            district = lease['district']
-            well_type = lease['well_type']
+        result = download_lease_production(
+            driver, lease_num, district, well_type, start_year, end_year, state=state
+        )
 
+        if result is None:
+            # Session timeout - recreate driver and retry
+            log.warning(f'Lease {lease_key}: recreating driver due to session issue')
+            driver.quit()
+            driver = create_driver()
             result = download_lease_production(
                 driver, lease_num, district, well_type, start_year, end_year, state=state
             )
 
             if result is None:
-                # Session timeout - recreate driver and retry
-                log.warning('Recreating driver due to session issue')
-                driver.quit()
-                driver = create_driver()
-                result = download_lease_production(
-                    driver, lease_num, district, well_type, start_year, end_year, state=state
-                )
+                log.warning(f'Lease {lease_key}: retry failed, skipping')
+                return ([], 'skip')
 
-                if result is None:
-                    log.warning('Retry failed, skipping lease')
-                    skipped_count += 1
-                    continue
+        if result:
+            log.info(f'Lease {lease_key}: {len(result)} new records')
+            return (result, 'ok')
+        else:
+            return ([], 'empty')
 
-            if result:
-                save_records(result, output_file)
-                total_records += len(result)
-                log.info(f'Lease {i}/{total_leases}: {len(result)} new records '
-                         f'({lease_num}, {district})')
-            else:
-                skipped_count += 1
-
-            # Rate limiting
-            time.sleep(2)
-
-        stats = state.stats() if state else {}
-        log.info(f'Download complete: {total_records} new records, '
-                 f'{skipped_count} leases skipped/had no new data')
-        if stats:
-            log.info(f'  Total tracked: {stats["leases"]} leases, '
-                     f'{stats["months"]} months of production data')
+    except Exception as e:
+        log.error(f'Lease {lease_key}: worker error: {e}')
+        return ([], 'error')
 
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
         if state:
             state.close()
 
+
+def download_all(leases, start_year, end_year, output_dir, state=None, num_threads=10):
+    """Download production data for all leases using a thread pool."""
+    global _csv_writer
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    output_file = output_path / 'texas_production_data.csv'
+
+    # Thread-safe CSV writer
+    _csv_writer = ThreadSafeCSVWriter(output_file, FIELD_NAMES)
+
+    # Get the db path from the state instance
+    db_path = state.db_path if state else None
+
+    total_records = 0
+    skipped_count = 0
+    error_count = 0
+    completed = 0
+    total_leases = len(leases)
+    lock = threading.Lock()
+
+    log.info(f'Starting download with {num_threads} threads for {total_leases} leases')
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        # Submit all work
+        futures = {}
+        for lease in leases:
+            future = executor.submit(
+                _worker, lease, start_year, end_year, db_path
+            )
+            futures[future] = lease
+
+        # Process results as they complete
+        for future in as_completed(futures):
+            lease = futures[future]
+            lease_key = f"{lease['district']}/{lease['lease_number']}"
+
+            try:
+                records, status = future.result()
+
+                with lock:
+                    completed += 1
+
+                    if records:
+                        _csv_writer.write_rows(records)
+                        total_records += len(records)
+
+                    if status == 'empty':
+                        skipped_count += 1
+                    elif status == 'error' or status == 'skip':
+                        error_count += 1
+
+                    # Progress log every 50 leases
+                    if completed % 50 == 0 or completed == total_leases:
+                        log.info(f'Progress: {completed}/{total_leases} leases '
+                                 f'({total_records} records, {skipped_count} empty, '
+                                 f'{error_count} errors)')
+
+            except Exception as e:
+                with lock:
+                    error_count += 1
+                    completed += 1
+                    log.error(f'Lease {lease_key}: exception in future result: {e}')
+
+    stats = state.stats() if state else {}
+    log.info(f'Download complete: {total_records} new records, '
+             f'{skipped_count} empty, {error_count} errors')
+    if stats:
+        log.info(f'  Total tracked: {stats["leases"]} leases, '
+                 f'{stats["months"]} months of production data')
+
+    _csv_writer = None
     return total_records
 
 
@@ -1261,6 +1348,12 @@ def main():
         action='store_true',
         help='Disable incremental download (re-download everything)'
     )
+    parser.add_argument(
+        '--threads',
+        type=int,
+        default=10,
+        help='Number of concurrent download threads. Default: 10'
+    )
 
     args = parser.parse_args()
 
@@ -1292,11 +1385,12 @@ def main():
             log.info('No previous download state found — starting fresh')
 
     if args.test:
-        # Test with first lease
+        # Test with first lease (single-threaded)
         test_lease = leases[0]
         log.info(f'TEST MODE: Downloading production for lease {test_lease["lease_number"]}, '
                  f'years {start_year}-{end_year}')
 
+        csv_writer = ThreadSafeCSVWriter('./data/test_production.csv', FIELD_NAMES)
         driver = create_driver()
         try:
             result = download_lease_production(
@@ -1312,17 +1406,18 @@ def main():
                 log.info(f'Got {len(result)} new records')
                 if result:
                     log.info(f'First record: {result[0]}')
-                    save_records(result, './data/test_production.csv')
+                    csv_writer.write_rows(result)
             else:
                 log.warning('No data returned')
         finally:
             driver.quit()
     else:
         log.info(f'Downloading production data for {start_year}-{end_year}')
-        log.info(f'Processing {len(leases)} leases')
+        log.info(f'Processing {len(leases)} leases with {args.threads} threads')
         log.info(f'Output directory: {args.output_dir}')
 
-        total = download_all(leases, start_year, end_year, args.output_dir, state=state)
+        total = download_all(leases, start_year, end_year, args.output_dir,
+                             state=state, num_threads=args.threads)
         log.info(f'Done! Downloaded {total} new records')
 
 
