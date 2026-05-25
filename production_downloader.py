@@ -325,6 +325,16 @@ def lookup_lat_lon_from_gis_viewer(driver, api_id):
         log.info(f'GIS Viewer: page loaded for API {api_id}, waiting for JS render...')
         time.sleep(5)
 
+        # Dismiss any JS alert (e.g., "Map feature was not found")
+        try:
+            alert = Alert(driver)
+            alert_text = alert.text
+            log.info(f'GIS Viewer: alert detected: "{alert_text}", dismissing')
+            alert.accept()
+            time.sleep(1)
+        except:
+            pass
+
         html = driver.page_source
 
         # Parse: GIS LAT (NAD83) and GIS LONG (NAD83) from HTML table
@@ -350,6 +360,13 @@ def lookup_lat_lon_from_gis_viewer(driver, api_id):
         log.info(f'GIS Viewer: no lat/lon found in page for API {api_id}')
         return None, None
 
+    except UnexpectedAlertPresentException as e:
+        log.info(f'GIS Viewer: unexpected alert for {api_id}, dismissing')
+        try:
+            Alert(driver).accept()
+        except:
+            pass
+        return None, None
     except Exception as e:
         log.info(f'GIS Viewer lookup failed for {api_id}: {e}')
         return None, None
