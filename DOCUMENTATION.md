@@ -2,23 +2,21 @@
 
 ## Overview
 
-Downloads Texas Railroad Commission (RRC) oil and gas production data using automated browser scraping. The system has three phases:
+Downloads Texas Railroad Commission (RRC) oil and gas production data using automated browser scraping. The system has two phases:
 
 1. **Lease Discovery** — Search for leases across all 13 Texas districts using common name patterns
-2. **Production Download** — Download monthly production data for discovered leases
-3. **Enrichment** — Look up operator names and GPS coordinates for each lease
+2. **Production Download** — Download monthly production data for discovered leases (includes built-in enrichment)
 
 ```
-Phase 1                Phase 2                 Phase 3
-┌───────────────┐   ┌──────────────────┐   ┌──────────────────┐
-│ Lease          │──>│ Production       │──>│ Enrichment       │
-│ Discovery      │   │ Download         │   │ (built-in)       │
-│ (Selenium)     │   │ (Selenium)       │   │ (HTTP + Selenium)│
-└───────────────┘   └──────────────────┘   └──────────────────┘
-       │                     │                       │
-       ▼                     ▼                       ▼
-  leases_discovered.csv  texas_production_data.csv  (same file,
-                                                       enriched)
+Phase 1                Phase 2
+┌───────────────┐   ┌──────────────────────────┐
+│ Lease          │──>│ Production Download      │
+│ Discovery      │   │ + Enrichment (built-in)  │
+│ (Selenium)     │   │ (multi-threaded)         │
+└───────────────┘   └──────────────────────────┘
+       │                          │
+       ▼                          ▼
+  leases_discovered.csv    texas_production_data.csv
 ```
 
 ## Prerequisites
@@ -47,7 +45,7 @@ Google Chrome (or Chromium) must be installed. The scraper uses Chrome's built-i
 ### 2. Download Production Data
 
 ```bash
-# Full download for all discovered leases
+# Full download for all discovered leases (10 threads by default)
 python3 production_downloader.py \
     --leases ./leases_discovered.csv \
     --years 2011-2025 \
@@ -141,7 +139,7 @@ Progress is saved after each (district, pattern) search completes. On restart, a
 Total: 5694 searches, 5690 already done, 4 remaining
 ```
 
-State file format:
+State file format (`discovery_state.json`):
 ```json
 {
   "01": ["AAA", "ABB", "SMITH", ...],
@@ -183,24 +181,24 @@ lease_number,district,name,well_type
 
 ### What It Does
 
-For each discovered lease, queries the RRC Production Data Query (PDQ) system to retrieve monthly oil and gas production data from January 1993 to present.
+For each discovered lease, queries the RRC Production Data Query (PDQ) system to retrieve monthly oil and gas production data from January 1993 to present. Downloads run in **10 parallel threads** by default, each with its own browser instance.
 
 ### Running the Downloader
 
 ```bash
-# Full download
+# Full download (10 threads, default)
 python3 production_downloader.py \
     --leases ./leases_discovered.csv \
     --years 2011-2025 \
     --output-dir ./data
 
-# Download specific year range
+# Custom thread count
 python3 production_downloader.py \
     --leases ./leases_discovered.csv \
-    --years 2020-2023 \
-    --output-dir ./data
+    --years 2020-2025 \
+    --threads 5
 
-# Test mode (first lease only)
+# Test mode (first lease only, single-threaded)
 python3 production_downloader.py \
     --leases ./leases_discovered.csv \
     --years 2020-2020 \
@@ -214,13 +212,25 @@ python3 production_downloader.py \
 | `--years` | `2011-2025` | Year range (e.g., `2020-2023`) |
 | `--leases` | `./leases_discovered.csv` | CSV file with discovered leases |
 | `--output-dir` | `./data` | Output directory for CSV files |
-| `--state-file` | `./data/download_state.json` | File tracking downloaded months |
+| `--state-file` | `./data/download_state.json` | SQLite database for tracking progress |
 | `--test` | Off | Test mode: download first lease only |
 | `--no-incremental` | Off | Disable incremental tracking (re-download everything) |
+| `--threads` | `10` | Number of concurrent download threads |
+
+### Multi-Threading
+
+The downloader uses `ThreadPoolExecutor` with 10 workers by default:
+
+- Each thread gets its own Chrome browser instance
+- Each thread gets its own SQLite connection (WAL mode handles concurrent access)
+- CSV writes are lock-protected to prevent interleaving
+- Progress is logged every 50 completed leases
+
+If you don't have enough RAM/CPU for 10 browsers, reduce `--threads`. For small lease sets, the overhead of spawning many browsers may make fewer threads faster.
 
 ### Incremental Downloads
 
-The downloader remembers what's already been downloaded. Each lease tracks which (year, month) combinations have been retrieved, stored in `./data/download_state.json`.
+The downloader remembers what's already been downloaded. Each lease tracks which (year, month) combinations have been retrieved, stored in a SQLite database.
 
 | Run | Command | Result |
 |-----|---------|--------|
@@ -229,31 +239,41 @@ The downloader remembers what's already been downloaded. Each lease tracks which
 | Expanded range | `python3 production_downloader.py --years 2020-2024` | Downloads only 2024 (12 months) |
 | Next month | `python3 production_downloader.py --years 2011-2026` | Downloads only new months |
 
+Cross-range independence: running `2022-2026` then `2015-2021` works correctly — zero overlap, no duplication.
+
 ### Resuming Interrupted Runs
 
 If a run is interrupted (Ctrl+C, crash, timeout), just run the same command again. The state file tracks what was successfully saved, so only missing data will be re-downloaded.
 
-### Download State
+### Download State (SQLite)
 
-State file format:
-```json
-{
-  "leases": {
-    "01/162326": {
-      "_county": "MCMULLEN",
-      "_api_id": "31133330",
-      "_operator": "XTO ENERGY INC.",
-      "_operator_no": "945936",
-      "_lat": 28.413687,
-      "_lon": -98.496463,
-      "2020": ["Jan", "Feb", "Mar", ..., "Dec"],
-      "2021": ["Jan", "Feb", ..., "Dec"]
-    }
-  }
-}
+State is stored in a SQLite database (`.db` file) for fast random access. The first run on an old `.json` state file will auto-migrate it and create a `.json.bak` backup.
+
+Database schema:
+```sql
+-- Per-lease metadata (operator, lat/lon, county, etc.)
+CREATE TABLE lease_metadata (
+    lease_key TEXT PRIMARY KEY,
+    county TEXT,
+    api_id TEXT,
+    operator TEXT,
+    operator_no TEXT,
+    lat REAL,
+    lon REAL
+);
+
+-- Month tracking with bitmasks (12 bits = one year)
+CREATE TABLE downloaded_months (
+    lease_key TEXT,
+    year INTEGER,
+    month_mask INTEGER,  -- e.g., 0xFFF = all 12 months
+    PRIMARY KEY (lease_key, year)
+);
 ```
 
-Keys prefixed with `_` are cached metadata:
+Month bitmasks are integers where each bit represents a month (bit 0 = Jan, bit 11 = Dec). A fully downloaded year has mask `4095` (0xFFF = 111111111111₂).
+
+Cached metadata keys:
 - `_county` — County name (extracted from PDQ)
 - `_api_id` — Internal EWA API ID (for GIS/operator lookup)
 - `_operator` / `_operator_no` — Current operator name and number
@@ -297,87 +317,27 @@ The downloader automatically enriches records with:
 
 All enrichment results are cached in the download state, so subsequent runs skip the extra lookups.
 
+### Logging
+
+Dual logging is configured automatically:
+
+| Destination | Level | Purpose |
+|-------------|-------|---------|
+| **Console** | INFO+ | Clean output for normal monitoring |
+| **File** | DEBUG+ | Full detail for debugging hangs |
+
+Log file: `logs/production_downloader.log`
+- Automatically appends across runs
+- Rotates at 50MB, keeps 5 backups
+- Includes Selenium HTTP wire logs (request/response, timeouts)
+
 ### Estimated Runtime
 
-| Operation | Scope | Time |
-|-----------|-------|------|
-| Single lease, 15 years | 1 lease | ~30 seconds |
-| 1,000 leases, 15 years | 1K leases | ~8 hours |
-| 100,000 leases, 15 years | 100K leases | ~33 days |
-
----
-
-## Standalone API Lat/Lon Lookup
-
-If you already have API numbers and just need coordinates, use `api_latlon_lookup.py` instead of running the full production download pipeline.
-
-### Lookup Strategies
-
-| Strategy | Coverage | Speed | Dependencies |
-|----------|----------|-------|--------------|
-| **University Lands API** | Texas state-owned (University Lands) wells | ~1s per well | `requests` |
-| **FracFocus index** | Hydraulically fractured wells (~115k TX wells) | Instant (local) | FracFocus CSV download |
-| **RRC GIS Viewer** | **All Texas wells** | ~10s per well | Selenium + Chrome |
-
-### Quick Examples
-
-```bash
-# University Lands API (fast, no setup)
-python3 api_latlon_lookup.py --apis 4200307433 4247532226
-
-# Bulk lookup from CSV
-python3 api_latlon_lookup.py --input my_apis.csv --output coords.csv
-
-# Build FracFocus index for fractured wells
-python3 api_latlon_lookup.py --build-fracfocus ./DisclosureList_1.csv
-
-# RRC GIS Viewer (comprehensive, requires EWA API ID)
-python3 api_latlon_lookup.py --rrc --api-id 31133330
-```
-
-### University Lands API
-
-The fastest option. Works for any well on Texas University Lands (major Permian Basin counties like Andrews, Reagan, Upton, Ward, Winkler, etc.).
-
-```bash
-python3 api_latlon_lookup.py --apis 4200307433 4247532226
-```
-
-Output:
-```
-api_number,latitude,longitude,datum,source
-4200307433,32.14411135,-102.57488247,NAD83,university_lands
-4247532226,31.63308093,-103.21707402,NAD83,university_lands
-```
-
-### FracFocus Index
-
-FracFocus publishes a free CSV download of all hydraulically fractured wells in the US, including lat/lon. Build a local index once, then lookups are instant.
-
-1. Download the CSV from [FracFocus](https://www.fracfocusdata.org/digitaldownload/FracFocusCSV.zip) (~3.5 GB)
-2. Build the index:
-   ```bash
-   unzip FracFocusCSV.zip DisclosureList_1.csv
-   python3 api_latlon_lookup.py --build-fracfocus ./DisclosureList_1.csv
-   ```
-3. Run lookups — the script automatically uses the index:
-   ```bash
-   python3 api_latlon_lookup.py --input apis.csv --output coords.csv
-   ```
-
-### RRC GIS Viewer (Comprehensive)
-
-For wells not covered by the above sources, the RRC GIS Viewer has coordinates for virtually all Texas wells. This requires:
-1. An **EWA API ID** (internal RRC identifier, e.g. `31133330`)
-2. Selenium + Chrome
-
-The `production_downloader.py` pipeline automatically resolves EWA API IDs from lease numbers + districts. If you already have an API ID:
-
-```bash
-python3 api_latlon_lookup.py --rrc --api-id 31133330
-```
-
-If you only have lease number + district, use the full pipeline in `production_downloader.py` instead — it handles the EWA → GIS lookup chain automatically.
+| Operation | Scope | 1 thread | 10 threads |
+|-----------|-------|----------|------------|
+| Single lease, 1 year | 1 lease | ~30 sec | ~30 sec |
+| 1,000 leases, 15 years | 1K leases | ~8 hours | ~50 min |
+| 100,000 leases, 15 years | 100K leases | ~33 days | ~3 days |
 
 ---
 
@@ -397,7 +357,7 @@ The RRC systems use Java servlet sessions (`JSESSIONID`) embedded in URLs and co
 
 - **PDQ**: Use a single Selenium browser session for all interactions. Form submissions must use the exact action URL from the page (includes jsessionid). Sessions timeout after inactivity — detect "Session Timed Out" in page source and recreate the driver.
 - **EWA**: Requires session cookies. **Important**: Direct URL navigation to `leaseDetailAction.do` causes "General Exception" errors. You must navigate from the wellbore results page by clicking the API number link.
-- **GIS Viewer**: JS-rendered page. Requires `time.sleep(5)` after navigation for the well data to load.
+- **GIS Viewer**: JS-rendered page. Requires `time.sleep(5)` after navigation for the well data to load. May show a "Map feature was not found" alert for wells not mapped — this is automatically dismissed.
 
 ### Operator Lookup Flow
 
@@ -423,8 +383,8 @@ EWA Wellbore Query                    EWA Lease Detail
 EWA API ID (cached)                GIS Viewer Page
 ┌───────────────────┐              ┌───────────────────┐
 │ api_id: 31133330  │────────────>│ Parse from HTML:  │
-│ (from operator    │  HTTP GET    │  GIS LAT (NAD83)  │
-│  lookup)          │              │  GIS LONG (NAD83) │
+│ (from operator    │  Selenium    │  GIS LAT (NAD83)  │
+│  lookup)          │  GET         │  GIS LONG (NAD83) │
 └───────────────────┘              └───────────────────┘
                                            │
                                            ▼
@@ -451,17 +411,12 @@ Example: `4231116232605` = `42-311-162326-05`
 ```
 rrc-scraper/
 ├── lease_discovery.py            # Phase 1: Discover leases
-├── production_downloader.py      # Phase 2: Download + enrichment
-├── api_latlon_lookup.py          # Standalone lat/lon lookup by API number
+├── production_downloader.py      # Phase 2: Multi-threaded download + enrichment
 ├── discover_all_leases.sh        # Shell wrapper for full discovery
-├── RRCScraper.py                 # Original scraper (deprecated)
-├── scrape.py                     # Original CLI wrapper (deprecated)
-├── test_leases.csv               # Sample lease file
-├── gis_enrichment.py             # Standalone GIS enrichment (deprecated)
 ├── data/
-│   ├── county_bboxes.json        # County bounding boxes (pre-computed)
-│   ├── download_state.json       # Download progress state
-│   └── texas_production_data.csv # Output production data
+│   └── county_bboxes.json        # County bounding boxes (pre-computed)
+├── logs/
+│   └── production_downloader.log # Debug log (auto-created)
 └── .git/
 ```
 
@@ -472,6 +427,7 @@ rrc-scraper/
 The RRC PDQ system uses Java sessions that timeout. The scripts automatically detect this and recreate the browser session. If you see repeated timeouts, try:
 - Reducing the number of leases processed per run
 - Running year-by-year instead of all years at once
+- Reducing `--threads` (fewer concurrent sessions = fewer timeouts)
 
 ### "Lease number is invalid"
 
@@ -498,12 +454,16 @@ Direct URL navigation to `leaseDetailAction.do` without proper session context c
 
 ### State file corruption
 
-If the state file becomes corrupted, delete it and re-run. The CSV output file is not affected (it's appended to, not overwritten):
+If the SQLite state file becomes corrupted, delete it and re-run. The CSV output file is not affected (it's appended to, not overwritten):
 
 ```bash
-rm ./data/download_state.json      # Reset production download state
-rm ./data/discovery_state.json     # Reset lease discovery state
+rm ./data/download_state.db       # Reset production download state
+rm ./data/discovery_state.json    # Reset lease discovery state
 ```
+
+### Debugging hangs
+
+Check `logs/production_downloader.log` for the last INFO/DEBUG line before the hang. The log includes full Selenium HTTP wire logs, so you can see exactly which request stalled.
 
 ---
 
