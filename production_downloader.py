@@ -14,6 +14,7 @@ import csv
 import datetime
 import json
 import logging
+import logging.handlers
 import os
 import re
 import sqlite3
@@ -30,12 +31,43 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.alert import Alert
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, UnexpectedAlertPresentException
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+
+def _setup_logging():
+    """Configure logging: INFO to console, DEBUG to rotating file."""
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Console handler — INFO and above
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+
+    # File handler — DEBUG and above, 50MB rotating, keep 5 backups
+    log_dir = Path(__file__).parent / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / 'production_downloader.log'
+    file_handler = logging.handlers.RotatingFileHandler(
+        str(log_file),
+        maxBytes=50 * 1024 * 1024,  # 50MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+    return str(log_file)
+
+
+LOG_FILE = _setup_logging()
 log = logging.getLogger(__name__)
+log.info(f'Debug log: {LOG_FILE}')
 
 PDQ_BASE = 'https://webapps.rrc.texas.gov'
 

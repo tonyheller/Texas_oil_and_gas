@@ -9,6 +9,7 @@ __pycache__/
 
 # Generated data (do not commit)
 data/
+logs/
 *.log
 leases_district_*.csv
 leases_discovered.csv
