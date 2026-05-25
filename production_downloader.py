@@ -662,26 +662,10 @@ def extract_production_data(driver, state=None, lease_key=None):
         #     <td>Operator Name</td><td>Operator No.</td>
         #     <td>Field Name</td><td>Field No.</td></tr>
         # Operator/field only appear in the first row; subsequent rows have empty cells.
-        if not lease_info.get('operator'):
-            log.info(f'Extract: trying operator regex on first data row...')
-            op_match = re.search(
-                r'<tr[^>]*>.*?<strong>\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s*</strong>'
-                r'</td>\s*<td[^>]*>.*?</td>\s*<td[^>]*>.*?</td>'
-                r'\s*<td[^>]*>.*?</td>\s*<td[^>]*>.*?</td>'
-                r'\s*<td[^>]*>\s*([A-Z][A-Z\s\.\&\(\)\-]+?)\s*</td>'
-                r'\s*<td[^>]*>\s*(\d+)\s*</td>'
-                r'\s*<td[^>]*>\s*([A-Z][A-Z\s\.\(\)\-]+?)\s*</td>'
-                r'\s*<td[^>]*>\s*(\d+)\s*</td>',
-                source, re.DOTALL
-            )
-            if op_match:
-                lease_info['operator'] = op_match.group(1).strip()
-                lease_info['operator_no'] = op_match.group(2).strip()
-                lease_info['field'] = op_match.group(3).strip()
-                lease_info['field_no'] = op_match.group(4).strip()
-                log.info(f'Extract: operator={op_match.group(1).strip()} ({op_match.group(2)}), field={op_match.group(3).strip()} ({op_match.group(4)})')
-            else:
-                log.info(f'Extract: operator regex did not match (will try EWA fallback)')
+        # We extract them below from the first data row during row processing.
+        # (The old full-page regex with re.DOTALL caused catastrophic backtracking
+        # on 65KB+ pages, hanging for minutes.)
+        log.info(f'Extract: operator will be extracted from the first data row below')
 
         # Find all table rows
         rows = re.findall(r'<tr[^>]*>(.*?)</tr>', source, re.DOTALL)
