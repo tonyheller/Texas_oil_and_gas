@@ -583,13 +583,18 @@ def extract_production_data(driver, state=None, lease_key=None):
 
     try:
         # Try to click "View All Results" to avoid pagination
+        log.info(f'Extract: clicking "View All Results" to get full page...')
         view_all_links = driver.find_elements(By.LINK_TEXT, 'View All Results')
         if view_all_links:
             view_all_links[0].click()
             time.sleep(3)
+            log.info(f'Extract: clicked "View All Results"')
+        else:
+            log.info(f'Extract: no "View All Results" link found (data may already be visible)')
 
         # Get page source
         source = driver.page_source
+        log.info(f'Extract: page source loaded ({len(source)} chars)')
 
         # Extract lease info from page
         # Pattern: "Lease Name: SMITH, Lease No: 162326, Well No: 5"
@@ -602,6 +607,7 @@ def extract_production_data(driver, state=None, lease_key=None):
             lease_info['lease_name'] = lease_match.group(1).strip()
             lease_info['lease_number'] = lease_match.group(2)
             lease_info['well_number'] = lease_match.group(3)
+            log.info(f'Extract: lease={lease_match.group(1).strip()}, no={lease_match.group(2)}, well={lease_match.group(3)}')
         else:
             # Try without well number
             lease_match = re.search(
@@ -610,22 +616,28 @@ def extract_production_data(driver, state=None, lease_key=None):
             if lease_match:
                 lease_info['lease_name'] = lease_match.group(1).strip()
                 lease_info['lease_number'] = lease_match.group(2)
+                log.info(f'Extract: lease={lease_match.group(1).strip()}, no={lease_match.group(2)}, well=not found')
 
         # Extract district
         district_match = re.search(r'District\s+(\d{2})', source)
         if district_match:
             lease_info['district'] = district_match.group(1)
+            log.info(f'Extract: district={district_match.group(1)}')
 
         # Get county (from cache or by navigating to County Production view)
         county_name = None
         if state and lease_key:
             county_name = state.get_county(lease_key)
+            if county_name:
+                log.info(f'Extract: county from cache: {county_name}')
 
         if not county_name:
+            log.info(f'Extract: county not cached, navigating to County Production view...')
             county_name = _extract_county(driver, source)
             if county_name and state and lease_key:
                 state.set_county(lease_key, county_name)
                 state.save()
+                log.info(f'Extract: county cached as {county_name}')
 
         if county_name:
             lease_info['county'] = county_name
@@ -636,7 +648,10 @@ def extract_production_data(driver, state=None, lease_key=None):
             )
             if api:
                 lease_info['api_number'] = api
-        
+                log.info(f'Extract: API number built: {api}')
+            else:
+                log.info(f'Extract: could not build API number (county "{county_name}" not in FIPS table)')
+
         # Extract operator and field from the first data row in the table.
         # The HTML structure for each row is:
         # <tr><td><strong>Month Year</strong></td>
@@ -646,6 +661,7 @@ def extract_production_data(driver, state=None, lease_key=None):
         #     <td>Field Name</td><td>Field No.</td></tr>
         # Operator/field only appear in the first row; subsequent rows have empty cells.
         if not lease_info.get('operator'):
+            log.info(f'Extract: trying operator regex on first data row...')
             op_match = re.search(
                 r'<tr[^>]*>.*?<strong>\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s*</strong>'
                 r'</td>\s*<td[^>]*>.*?</td>\s*<td[^>]*>.*?</td>'
@@ -661,31 +677,33 @@ def extract_production_data(driver, state=None, lease_key=None):
                 lease_info['operator_no'] = op_match.group(2).strip()
                 lease_info['field'] = op_match.group(3).strip()
                 lease_info['field_no'] = op_match.group(4).strip()
-        
-        # Look for table rows with monthly data
-        # Pattern: <td><strong>Jan 2020</strong></td> followed by value cells
-        # "Jan 2020 932 932 0 0"
-        
+                log.info(f'Extract: operator={op_match.group(1).strip()} ({op_match.group(2)}), field={op_match.group(3).strip()} ({op_match.group(4)})')
+            else:
+                log.info(f'Extract: operator regex did not match (will try EWA fallback)')
+
         # Find all table rows
         rows = re.findall(r'<tr[^>]*>(.*?)</tr>', source, re.DOTALL)
-        
+        log.info(f'Extract: found {len(rows)} HTML rows in page source')
+
         # Track operator/field info (appears in first data row)
         operator_found = False
-        
+
         # Process rows looking for month data
+        months_parsed = 0
         for row in rows:
             # Look for month in this row
             month_match = re.search(r'<strong>\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s*</strong>', row)
-            
+
             if month_match:
                 month = month_match.group(1)
                 year = month_match.group(2)
-                
+                months_parsed += 1
+
                 # Extract numeric values from the row
                 # Remove the month TD, then find value TDs
                 row_without_month = re.sub(r'<td[^>]*><strong>.*?</strong></td>', '', row, count=1)
                 value_tds = re.findall(r'<td[^>]*>([^<]*)</td>', row_without_month)
-                
+
                 values = []
                 for val in value_tds[:6]:  # Take up to 6 values (prod, disp, oil_prod, oil_disp, operator, field)
                     val_clean = val.strip().replace(',', '')
@@ -694,7 +712,7 @@ def extract_production_data(driver, state=None, lease_key=None):
                         values.append(float(val_clean) if val_clean else 0.0)
                     except ValueError:
                         values.append(val_clean)  # Keep as text (operator/field name)
-                
+
                 # Extract operator and field from first row
                 if not operator_found and len(values) >= 6:
                     if isinstance(values[4], str) and values[4]:
@@ -702,7 +720,8 @@ def extract_production_data(driver, state=None, lease_key=None):
                     if isinstance(values[5], str) and values[5]:
                         lease_info['field'] = values[5]
                     operator_found = True
-                
+                    log.info(f'Extract: operator from row values: {values[4]}, field: {values[5]}')
+
                 # Ensure we have at least 4 numeric values
                 numeric_values = []
                 for v in values[:4]:
@@ -710,7 +729,7 @@ def extract_production_data(driver, state=None, lease_key=None):
                         numeric_values.append(v)
                     else:
                         numeric_values.append(0.0)
-                
+
                 if len(numeric_values) >= 4:
                     record = {
                         'month': month,
@@ -725,10 +744,10 @@ def extract_production_data(driver, state=None, lease_key=None):
                     }
                     record.update(lease_info)
                     records.append(record)
-        
-        log.info(f'Extracted {len(records)} monthly records')
+
+        log.info(f'Extract: parsed {months_parsed} months with data, built {len(records)} records')
         return records
-        
+
     except Exception as e:
         log.error(f'Error extracting production data: {e}')
         return records
