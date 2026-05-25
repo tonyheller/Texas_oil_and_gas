@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 from urllib.request import urlopen, Request
@@ -136,164 +137,323 @@ DEFAULT_START_YEAR = CURRENT_YEAR - 15
 DEFAULT_END_YEAR = CURRENT_YEAR
 
 
+# Month abbreviation ↔ bit index mapping (bit 0 = Jan, bit 11 = Dec)
+_MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+_MONTH_BITS = {name: i for i, name in enumerate(_MONTH_NAMES)}
+
+
 class DownloadState:
-    """Tracks what production data has been downloaded, per lease."""
+    """SQLite-backed state tracking for production downloads.
+
+    Uses integer bitmasks for month tracking (12 months per year = one int)
+    and a separate metadata table. WAL journaling enables fast writes
+    without full-file rewrites. Scales to millions of leases.
+    """
 
     def __init__(self, state_file):
-        self.state_file = Path(state_file)
-        self._data = self._load()
+        self.db_path = Path(state_file)
+        # If the user pointed to a .json file, redirect to .db
+        if self.db_path.suffix == '.json':
+            self.db_path = self.db_path.with_suffix('.db')
+        self._conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+        self._conn.execute('PRAGMA journal_mode=WAL')
+        self._conn.execute('PRAGMA synchronous=NORMAL')
+        self._create_tables()
+        self._maybe_migrate_legacy_json(state_file)
 
-    def _load(self):
-        if self.state_file.exists():
-            with open(self.state_file, 'r') as f:
-                return json.load(f)
-        return {'leases': {}}
+    def _create_tables(self):
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS lease_metadata (
+                lease_key TEXT PRIMARY KEY,
+                county TEXT,
+                api_id TEXT,
+                operator TEXT,
+                operator_no TEXT,
+                lat REAL,
+                lon REAL
+            )
+        ''')
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS downloaded_months (
+                lease_key TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                month_mask INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (lease_key, year)
+            )
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_dl_lease
+            ON downloaded_months(lease_key)
+        ''')
+        self._conn.commit()
+
+    def _maybe_migrate_legacy_json(self, original_path):
+        """Migrate old JSON state file to SQLite on first use, then delete JSON."""
+        json_path = Path(original_path)
+        if not json_path.exists() or json_path.suffix != '.json':
+            return
+
+        # Check if we already migrated (db has data)
+        count = self._conn.execute('SELECT COUNT(*) FROM lease_metadata').fetchone()[0]
+        if count > 0:
+            return  # Already migrated or db was pre-populated
+
+        log.info(f'Migrating legacy JSON state {json_path} to SQLite...')
+        try:
+            with open(json_path, 'r') as f:
+                legacy = json.load(f)
+
+            leases = legacy.get('leases', {})
+            if not leases:
+                return
+
+            meta_rows = []
+            month_rows = []
+            for lease_key, lease_state in leases.items():
+                county = lease_state.get('_county')
+                api_id = lease_state.get('_api_id')
+                operator = lease_state.get('_operator')
+                operator_no = lease_state.get('_operator_no')
+                lat = lease_state.get('_lat')
+                lon = lease_state.get('_lon')
+
+                if any(v is not None for v in [county, api_id, operator, lat]):
+                    meta_rows.append((lease_key, county, api_id, operator, operator_no, lat, lon))
+
+                for year_str, month_list in lease_state.items():
+                    if year_str.startswith('_'):
+                        continue
+                    if not isinstance(month_list, list):
+                        continue
+                    try:
+                        year = int(year_str)
+                    except ValueError:
+                        continue
+                    mask = 0
+                    for m in month_list:
+                        if m in _MONTH_BITS:
+                            mask |= (1 << _MONTH_BITS[m])
+                    if mask:
+                        month_rows.append((lease_key, year, mask))
+
+            if meta_rows:
+                self._conn.execute('BEGIN')
+                self._conn.executemany(
+                    'INSERT OR IGNORE INTO lease_metadata VALUES (?,?,?,?,?,?,?)',
+                    meta_rows
+                )
+            if month_rows:
+                if not meta_rows:
+                    self._conn.execute('BEGIN')
+                self._conn.executemany(
+                    'INSERT OR IGNORE INTO downloaded_months VALUES (?,?,?)',
+                    month_rows
+                )
+            self._conn.execute('COMMIT')
+            log.info(f'Migrated {len(meta_rows)} lease metadata and {len(month_rows)} month records')
+
+            # Back up and remove old JSON file
+            backup = json_path.with_suffix('.json.bak')
+            json_path.rename(backup)
+            log.info(f'Legacy JSON state backed up to {backup}')
+
+        except Exception as e:
+            log.warning(f'Failed to migrate legacy JSON state: {e}')
 
     def save(self):
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.state_file, 'w') as f:
-            json.dump(self._data, f, indent=2)
+        """No-op for SQLite backend. Data is committed atomically on every write."""
+        pass
+
+    def _commit(self):
+        """Force a commit (used at lease boundaries)."""
+        self._conn.commit()
 
     def get_county(self, lease_key):
         """Get cached county name for a lease, or None."""
-        lease_state = self._data['leases'].get(lease_key, {})
-        return lease_state.get('_county')
+        row = self._conn.execute(
+            'SELECT county FROM lease_metadata WHERE lease_key = ?',
+            (lease_key,)
+        ).fetchone()
+        return row[0] if row else None
 
     def set_county(self, lease_key, county_name):
         """Cache county name for a lease."""
-        if lease_key not in self._data['leases']:
-            self._data['leases'][lease_key] = {}
-        self._data['leases'][lease_key]['_county'] = county_name
+        self._conn.execute(
+            'INSERT INTO lease_metadata (lease_key, county) VALUES (?, ?) '
+            'ON CONFLICT(lease_key) DO UPDATE SET county = ?',
+            (lease_key, county_name, county_name)
+        )
 
     def get_lat_lon(self, lease_key):
         """Get cached lat/lon for a lease."""
-        lease_state = self._data['leases'].get(lease_key, {})
-        lat = lease_state.get('_lat')
-        lon = lease_state.get('_lon')
-        if lat is not None and lon is not None:
-            return (lat, lon)
+        row = self._conn.execute(
+            'SELECT lat, lon FROM lease_metadata WHERE lease_key = ?',
+            (lease_key,)
+        ).fetchone()
+        if row and row[0] is not None and row[1] is not None:
+            return (row[0], row[1])
         return None
 
     def set_lat_lon(self, lease_key, lat, lon):
         """Cache lat/lon for a lease."""
-        if lease_key not in self._data['leases']:
-            self._data['leases'][lease_key] = {}
-        self._data['leases'][lease_key]['_lat'] = lat
-        self._data['leases'][lease_key]['_lon'] = lon
+        self._conn.execute(
+            'INSERT INTO lease_metadata (lease_key, lat, lon) VALUES (?, ?, ?) '
+            'ON CONFLICT(lease_key) DO UPDATE SET lat = ?, lon = ?',
+            (lease_key, lat, lon, lat, lon)
+        )
 
     def get_operator(self, lease_key):
         """Get cached operator info for a lease."""
-        lease_state = self._data['leases'].get(lease_key, {})
-        name = lease_state.get('_operator')
-        no = lease_state.get('_operator_no')
-        if name:
-            return (name, no)
+        row = self._conn.execute(
+            'SELECT operator, operator_no FROM lease_metadata WHERE lease_key = ?',
+            (lease_key,)
+        ).fetchone()
+        if row and row[0]:
+            return (row[0], row[1])
         return None
 
     def set_operator(self, lease_key, name, no):
         """Cache operator info for a lease."""
-        if lease_key not in self._data['leases']:
-            self._data['leases'][lease_key] = {}
-        self._data['leases'][lease_key]['_operator'] = name
-        self._data['leases'][lease_key]['_operator_no'] = no
+        self._conn.execute(
+            'INSERT INTO lease_metadata (lease_key, operator, operator_no) VALUES (?, ?, ?) '
+            'ON CONFLICT(lease_key) DO UPDATE SET operator = ?, operator_no = ?',
+            (lease_key, name, no, name, no)
+        )
 
     def get_api_id(self, lease_key):
         """Get cached EWA API ID for a lease."""
-        lease_state = self._data['leases'].get(lease_key, {})
-        return lease_state.get('_api_id')
+        row = self._conn.execute(
+            'SELECT api_id FROM lease_metadata WHERE lease_key = ?',
+            (lease_key,)
+        ).fetchone()
+        return row[0] if row else None
 
     def set_api_id(self, lease_key, api_id):
         """Cache EWA API ID for a lease."""
-        if lease_key not in self._data['leases']:
-            self._data['leases'][lease_key] = {}
-        self._data['leases'][lease_key]['_api_id'] = api_id
+        self._conn.execute(
+            'INSERT INTO lease_metadata (lease_key, api_id) VALUES (?, ?) '
+            'ON CONFLICT(lease_key) DO UPDATE SET api_id = ?',
+            (lease_key, api_id, api_id)
+        )
 
     def get_downloaded_months(self, lease_key):
         """
-        Return set of (year, month) tuples already downloaded for a lease.
-
-        lease_key: 'district/lease_number' e.g. '01/162326'
+        Return set of (year, month_name) tuples already downloaded for a lease.
         """
-        lease_state = self._data['leases'].get(lease_key, {})
+        rows = self._conn.execute(
+            'SELECT year, month_mask FROM downloaded_months WHERE lease_key = ?',
+            (lease_key,)
+        ).fetchall()
+
         months = set()
-        for year_str, month_list in lease_state.items():
-            # Skip internal keys like _county
-            if year_str.startswith('_'):
-                continue
-            if isinstance(month_list, list):
-                for m in month_list:
-                    try:
-                        months.add((int(year_str), m))
-                    except ValueError:
-                        pass
+        for year, mask in rows:
+            for bit in range(12):
+                if mask & (1 << bit):
+                    months.add((year, _MONTH_NAMES[bit]))
         return months
 
     def record_downloaded(self, lease_key, records):
         """
         Mark specific (year, month) combos as downloaded.
-
-        records: list of dicts with 'year' and 'month' keys
+        Uses bitwise OR to merge new months with existing bitmask.
         """
-        if lease_key not in self._data['leases']:
-            self._data['leases'][lease_key] = {}
-
+        # Build bitmask per year
+        year_masks = {}
         for rec in records:
-            year = str(rec['year'])
-            month = rec['month']
-            if year not in self._data['leases'][lease_key]:
-                self._data['leases'][lease_key][year] = []
-            if month not in self._data['leases'][lease_key][year]:
-                self._data['leases'][lease_key][year].append(month)
+            year = int(rec['year'])
+            month_name = rec['month']
+            bit = _MONTH_BITS.get(month_name)
+            if bit is None:
+                continue
+            year_masks[year] = year_masks.get(year, 0) | (1 << bit)
+
+        for year, mask in year_masks.items():
+            self._conn.execute(
+                'INSERT INTO downloaded_months (lease_key, year, month_mask) '
+                'VALUES (?, ?, ?) '
+                'ON CONFLICT(lease_key, year) DO UPDATE SET month_mask = month_mask | ?',
+                (lease_key, year, mask, mask)
+            )
 
     def needs_download(self, lease_key, start_year, end_year):
         """
-        Determine what (year, month) ranges still need downloading.
+        Determine what year ranges still need downloading.
 
+        Uses bitmasks: if month_mask == 0xFFF (all 12 bits set), the year is complete.
         Returns (needed, already_have) tuple:
           needed: list of (start, end) year ranges that need downloading
-          already_have: count of months already downloaded in the requested range
+          already_have: count of months already downloaded
         """
-        have = self.get_downloaded_months(lease_key)
+        rows = self._conn.execute(
+            'SELECT year, month_mask FROM downloaded_months WHERE lease_key = ?',
+            (lease_key,)
+        ).fetchall()
 
-        # Build set of all months in requested range
-        all_months = set()
+        # Build lookup of known masks
+        known_masks = {year: mask for year, mask in rows}
+
+        already_count = 0
+        missing_years = []
+
         for year in range(start_year, end_year + 1):
-            for month in range(1, 13):
-                all_months.add((year, month))
+            mask = known_masks.get(year, 0)
+            # Count set bits
+            bits = bin(mask).count('1')
+            already_count += bits
+            if bits < 12:
+                missing_years.append(year)
 
-        missing = all_months - have
-        already_count = len(all_months & have)
-
-        if not missing:
+        if not missing_years:
             return [], already_count
 
-        # Consolidate missing months into year ranges
-        missing_years = sorted(set(y for y, m in missing))
+        # Consolidate into contiguous ranges
         ranges = []
-        if missing_years:
-            range_start = missing_years[0]
-            range_end = missing_years[0]
-            for y in missing_years[1:]:
-                if y == range_end + 1:
-                    range_end = y
-                else:
-                    ranges.append((range_start, range_end))
-                    range_start = y
-                    range_end = y
-            ranges.append((range_start, range_end))
+        range_start = missing_years[0]
+        range_end = missing_years[0]
+        for y in missing_years[1:]:
+            if y == range_end + 1:
+                range_end = y
+            else:
+                ranges.append((range_start, range_end))
+                range_start = y
+                range_end = y
+        ranges.append((range_start, range_end))
 
         return ranges, already_count
 
     def stats(self):
         """Return summary of download progress."""
-        total_leases = len(self._data['leases'])
-        total_months = sum(
-            len(months)
-            for lease_state in self._data['leases'].values()
-            for key, months in lease_state.items()
-            if not key.startswith('_')  # Skip metadata keys
-        )
+        total_leases = self._conn.execute(
+            'SELECT COUNT(DISTINCT lease_key) FROM ('
+            '  SELECT lease_key FROM lease_metadata'
+            '  UNION'
+            '  SELECT lease_key FROM downloaded_months'
+            ')'
+        ).fetchone()[0]
+
+        total_months = self._conn.execute(
+            'SELECT SUM(month_mask_bit_count) FROM ('
+            '  SELECT SUM('
+            '    (month_mask >> 0 & 1) + (month_mask >> 1 & 1) + (month_mask >> 2 & 1) +'
+            '    (month_mask >> 3 & 1) + (month_mask >> 4 & 1) + (month_mask >> 5 & 1) +'
+            '    (month_mask >> 6 & 1) + (month_mask >> 7 & 1) + (month_mask >> 8 & 1) +'
+            '    (month_mask >> 9 & 1) + (month_mask >> 10 & 1) + (month_mask >> 11 & 1)'
+            '  ) AS month_mask_bit_count'
+            '  FROM downloaded_months GROUP BY lease_key'
+            ')'
+        ).fetchone()[0] or 0
+
         return {'leases': total_leases, 'months': total_months}
+
+    def close(self):
+        """Close the database connection."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def __del__(self):
+        self.close()
 
 
 # GIS Viewer endpoint (gis2 REST API is down, use Viewer page instead)
@@ -1025,6 +1185,8 @@ def download_all(leases, start_year, end_year, output_dir, state=None):
 
     finally:
         driver.quit()
+        if state:
+            state.close()
 
     return total_records
 

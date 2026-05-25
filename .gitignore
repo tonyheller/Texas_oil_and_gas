@@ -13,6 +13,9 @@ data/
 leases_district_*.csv
 leases_discovered.csv
 test_leases.csv
+*.db
+*.db-wal
+*.db-shm
 download_state.json
 discovery_state.json
 texas_production_data.csv
