@@ -320,7 +320,9 @@ def lookup_lat_lon_from_gis_viewer(driver, api_id):
     url = GIS_VIEWER_URL.format(api_id=api_id)
 
     try:
+        log.info(f'GIS Viewer: requesting lat/lon for API {api_id}')
         driver.get(url)
+        log.info(f'GIS Viewer: page loaded for API {api_id}, waiting for JS render...')
         time.sleep(5)
 
         html = driver.page_source
@@ -332,7 +334,7 @@ def lookup_lat_lon_from_gis_viewer(driver, api_id):
         if lat_match and lon_match:
             lat = float(lat_match.group(1))
             lon = float(lon_match.group(1))
-            log.debug(f'GIS Viewer: lat={lat}, lon={lon} for API {api_id}')
+            log.info(f'GIS Viewer: found lat={lat}, lon={lon} (NAD83) for API {api_id}')
             return (lat, lon)
 
         # Fallback to NAD27 if NAD83 not found
@@ -342,14 +344,14 @@ def lookup_lat_lon_from_gis_viewer(driver, api_id):
         if lat_match and lon_match:
             lat = float(lat_match.group(1))
             lon = float(lon_match.group(1))
-            log.debug(f'GIS Viewer (NAD27): lat={lat}, lon={lon} for API {api_id}')
+            log.info(f'GIS Viewer: found lat={lat}, lon={lon} (NAD27) for API {api_id}')
             return (lat, lon)
 
-        log.debug(f'No lat/lon found in GIS Viewer for API {api_id}')
+        log.info(f'GIS Viewer: no lat/lon found in page for API {api_id}')
         return None, None
 
     except Exception as e:
-        log.debug(f'GIS Viewer lookup failed for {api_id}: {e}')
+        log.info(f'GIS Viewer lookup failed for {api_id}: {e}')
         return None, None
 
 
@@ -363,16 +365,21 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
     if state and lease_key:
         cached = state.get_operator(lease_key)
         if cached:
+            log.info(f'Operator lookup (cache hit): {cached[0]} ({cached[1]}) for {lease_key}')
             return cached
+
+    log.info(f'Operator lookup (EWA): district={district} lease={lease_number} key={lease_key}')
 
     try:
         # Step 1: Search by lease number + district in Wellbore Query
+        log.info(f'Operator step 1: navigating to EWA Wellbore Query...')
         driver.get(EWA_WELLBORE_URL)
+        log.info(f'Operator step 1: page loaded (title: {driver.title}), filling form...')
         time.sleep(2)
 
         # Check for session timeout or login redirect
         if 'Login' in driver.title or 'Choose an Application' in driver.page_source:
-            log.debug('EWA session expired')
+            log.info(f'Operator lookup: EWA session expired, cannot proceed')
             return None, None
 
         # Fill lease number
@@ -388,12 +395,14 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
         current_radio.click()
 
         # Submit
+        log.info(f'Operator step 1: submitting query for lease {lease_number}...')
         driver.find_element(By.CSS_SELECTOR, 'input[type="submit"]').click()
         time.sleep(3)
+        log.info(f'Operator step 1: results page loaded (title: {driver.title})')
 
         # Check results
         if 'No results found' in driver.page_source:
-            log.debug(f'No wellbore results for lease {lease_number}, district {district}')
+            log.info(f'Operator lookup: no wellbore results for lease {lease_number}, district {district}')
             return None, None
 
         # Extract the API ID from the results (e.g., "31133330")
@@ -403,10 +412,11 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
             source
         )
         if not api_id_match:
-            log.debug(f'No API ID found in wellbore results for lease {lease_number}')
+            log.info(f'Operator lookup: no API ID found in wellbore results for lease {lease_number}')
             return None, None
 
         api_id = api_id_match.group(1)
+        log.info(f'Operator step 1: found API ID {api_id}')
 
         # Cache the API ID for future GIS lookups
         if state and lease_key:
@@ -415,9 +425,11 @@ def lookup_operator(driver, district, lease_number, lease_key, state=None):
 
         # Step 2: Click the API number link to go to Lease Detail page
         # (direct URL navigation causes session errors)
+        log.info(f'Operator step 2: clicking API link {api_id} to view lease detail...')
         api_link = driver.find_element(By.LINK_TEXT, api_id)
         api_link.click()
         time.sleep(4)
+        log.info(f'Operator step 2: lease detail page loaded (title: {driver.title})')
 
         detail_source = driver.page_source
 
@@ -496,12 +508,15 @@ def _extract_county(driver, production_source):
     Returns county name string or None if not found.
     """
     try:
+        log.info(f'County lookup: clicking "County Production" link...')
         # Find and click County Production link
         county_links = driver.find_elements(By.LINK_TEXT, 'County Production')
         if not county_links:
+            log.info(f'County lookup: no County Production link found')
             return None
 
         county_links[0].click()
+        log.info(f'County lookup: navigating to county view...')
         time.sleep(3)
 
         county_source = driver.page_source
@@ -518,15 +533,19 @@ def _extract_county(driver, production_source):
         if county_match:
             county_name = county_match.group(1).strip()
             if county_name in TEXAS_COUNTY_FIPS:
+                log.info(f'County lookup: found {county_name} (HTML table match)')
                 return county_name
 
         # Fallback: look for county name in visible text near production numbers
+        log.info(f'County lookup: no HTML match, scanning visible text for county name...')
         body_text = driver.find_element(By.TAG_NAME, 'body').text
         for county_name in TEXAS_COUNTY_FIPS:
             # County name followed by a number (production value)
             if re.search(rf'\b{county_name}\b\s+[\d,]', body_text):
+                log.info(f'County lookup: found {county_name} (body text match)')
                 return county_name
 
+        log.info(f'County lookup: no match found')
         return None
 
     except Exception as e:
@@ -712,80 +731,86 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
     if state:
         ranges, already_count = state.needs_download(lease_key, start_year, end_year)
         if not ranges:
-            log.debug(f'Lease {lease_key}: all {already_count} months already downloaded')
+            log.info(f'Lease {lease_key}: all {already_count} months already downloaded, skipping')
             return []
 
         # Use the needed ranges (combine if multiple)
         effective_start = ranges[0][0]
         effective_end = ranges[-1][1]
-        log.debug(f'Lease {lease_key}: need {effective_start}-{effective_end} '
-                  f'({already_count} months already have)')
+        log.info(f'Lease {lease_key}: need {effective_start}-{effective_end} ({already_count} months already have)')
     else:
         effective_start = start_year
         effective_end = end_year
 
     try:
         # Navigate to Specific Lease Query
+        log.info(f'PDQ: navigating to lease query form...')
         driver.get(f'{PDQ_BASE}/PDQ/quickLeaseReportBuilderAction.do')
+        log.info(f'PDQ: form page loaded (title: {driver.title})')
         time.sleep(2)
-        
+
         # Check for session timeout
         if 'Session Timed Out' in driver.page_source:
             log.warning('Session timed out')
             return None
-        
+
         # Fill in the form
         well_type_value = 'Oil' if well_type == 'Oil' else 'Gas'
         well_type_radio = driver.find_element(By.XPATH, f'//input[@type="radio" and @value="{well_type_value}"]')
         well_type_radio.click()
-        
+
         # Enter lease number (with leading zeros if needed)
         lease_input = driver.find_element(By.NAME, 'leaseNumber')
         lease_input.clear()
         lease_input.send_keys(lease_number.zfill(5))
-        
+
         # Select district
         district_select = Select(driver.find_element(By.NAME, 'district'))
         district_value = DISTRICT_MAP.get(district, district)
         district_select.select_by_value(district_value)
-        
+
         # Select date range
         Select(driver.find_element(By.NAME, 'startMonth')).select_by_value('01')
         Select(driver.find_element(By.NAME, 'startYear')).select_by_value(str(effective_start))
         Select(driver.find_element(By.NAME, 'endMonth')).select_by_value('12')
         Select(driver.find_element(By.NAME, 'endYear')).select_by_value(str(effective_end))
-        
+
         # Submit form
+        log.info(f'PDQ: submitting query for lease {lease_number} (district {district}, {well_type}, {effective_start}-{effective_end})...')
         submit_btn = driver.find_element(By.XPATH, '//input[@type="submit" and @value="Submit"]')
         submit_btn.click()
         
         time.sleep(4)
-        
+
         # Handle alerts
         try:
             alert = Alert(driver)
             alert_text = alert.text
             if 'invalid' in alert_text.lower() or 'not found' in alert_text.lower():
-                log.debug(f'Lease {lease_number} invalid or not found')
+                log.info(f'PDQ: lease {lease_number} invalid or not found')
                 alert.accept()
                 return []
+            log.info(f'PDQ: alert dismissed: {alert_text}')
             alert.accept()
         except:
             pass
-        
+
         # Check results
+        log.info(f'PDQ: checking results page...')
         page_source = driver.page_source
-        
+
         if 'Session Timed Out' in page_source:
             log.warning('Session timed out after submit')
             return None
-        
+
         if 'No Data Found' in page_source or 'No Matches Found' in page_source:
-            log.debug(f'No data for lease {lease_number}, {start_year}-{end_year}')
+            log.info(f'PDQ: no data for lease {lease_number}, {effective_start}-{effective_end}')
             return []
-        
+
         # Extract production data
+        log.info(f'PDQ: extracting production data...')
         all_records = extract_production_data(driver, state=state, lease_key=lease_key)
+        log.info(f'PDQ: extracted {len(all_records)} production records for lease {lease_key}')
 
         # Add well_type to each record (from query parameter, not on page)
         if all_records:
@@ -798,12 +823,15 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
             operator_name = all_records[0].get('operator', '')
             operator_no = all_records[0].get('operator_no', '')
             if not operator_name and state:
+                log.info(f'Enrichment: operator not on PDQ page, looking up via EWA...')
                 op_name, op_no = lookup_operator(
                     driver, district, lease_number, lease_key, state=state
                 )
                 if op_name:
                     operator_name = op_name
                     operator_no = op_no or ''
+            elif operator_name:
+                log.info(f'Enrichment: operator from PDQ page: {operator_name} ({operator_no})')
 
             # --- Look up lat/lon via GIS Viewer ---
             lat = None
@@ -814,13 +842,16 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
                 cached = state.get_lat_lon(lease_key)
                 if cached:
                     lat, lon = cached
+                    log.info(f'Enrichment: lat/lon from cache: {lat}, {lon}')
                 else:
+                    log.info(f'Enrichment: lat/lon not cached, looking up...')
                     # Try to get EWA API ID from cache
                     api_id = state.get_api_id(lease_key)
                     if api_id:
                         lat, lon = lookup_lat_lon_from_gis_viewer(driver, api_id)
                     else:
                         # Need to query EWA first to get API ID
+                        log.info(f'Enrichment: no API ID cached, querying EWA operator lookup first...')
                         _, _ = lookup_operator(
                             driver, district, lease_number, lease_key, state=state
                         )
@@ -849,6 +880,8 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
                     rec['latitude'] = lat
                     rec['longitude'] = lon
 
+            log.info(f'Enrichment: operator={operator_name or "(unknown)"}, lat/lon={lat or "?"},{lon or "?"}')
+
         # Filter to only new records (exclude already-downloaded months)
         if state and all_records:
             have = state.get_downloaded_months(lease_key)
@@ -857,12 +890,14 @@ def download_lease_production(driver, lease_number, district, well_type, start_y
                 key = (int(rec['year']), rec['month'])
                 if key not in have:
                     new_records.append(rec)
+            log.info(f'PDQ: {len(new_records)} new records (out of {len(all_records)} extracted, {len(have)} already had)')
             all_records = new_records
 
         # Update state with what we just downloaded
         if state and all_records:
             state.record_downloaded(lease_key, all_records)
             state.save()
+            log.info(f'PDQ: state saved for {lease_key}')
 
         return all_records
 
