@@ -307,6 +307,80 @@ All enrichment results are cached in the download state, so subsequent runs skip
 
 ---
 
+## Standalone API Lat/Lon Lookup
+
+If you already have API numbers and just need coordinates, use `api_latlon_lookup.py` instead of running the full production download pipeline.
+
+### Lookup Strategies
+
+| Strategy | Coverage | Speed | Dependencies |
+|----------|----------|-------|--------------|
+| **University Lands API** | Texas state-owned (University Lands) wells | ~1s per well | `requests` |
+| **FracFocus index** | Hydraulically fractured wells (~115k TX wells) | Instant (local) | FracFocus CSV download |
+| **RRC GIS Viewer** | **All Texas wells** | ~10s per well | Selenium + Chrome |
+
+### Quick Examples
+
+```bash
+# University Lands API (fast, no setup)
+python3 api_latlon_lookup.py --apis 4200307433 4247532226
+
+# Bulk lookup from CSV
+python3 api_latlon_lookup.py --input my_apis.csv --output coords.csv
+
+# Build FracFocus index for fractured wells
+python3 api_latlon_lookup.py --build-fracfocus ./DisclosureList_1.csv
+
+# RRC GIS Viewer (comprehensive, requires EWA API ID)
+python3 api_latlon_lookup.py --rrc --api-id 31133330
+```
+
+### University Lands API
+
+The fastest option. Works for any well on Texas University Lands (major Permian Basin counties like Andrews, Reagan, Upton, Ward, Winkler, etc.).
+
+```bash
+python3 api_latlon_lookup.py --apis 4200307433 4247532226
+```
+
+Output:
+```
+api_number,latitude,longitude,datum,source
+4200307433,32.14411135,-102.57488247,NAD83,university_lands
+4247532226,31.63308093,-103.21707402,NAD83,university_lands
+```
+
+### FracFocus Index
+
+FracFocus publishes a free CSV download of all hydraulically fractured wells in the US, including lat/lon. Build a local index once, then lookups are instant.
+
+1. Download the CSV from [FracFocus](https://www.fracfocusdata.org/digitaldownload/FracFocusCSV.zip) (~3.5 GB)
+2. Build the index:
+   ```bash
+   unzip FracFocusCSV.zip DisclosureList_1.csv
+   python3 api_latlon_lookup.py --build-fracfocus ./DisclosureList_1.csv
+   ```
+3. Run lookups — the script automatically uses the index:
+   ```bash
+   python3 api_latlon_lookup.py --input apis.csv --output coords.csv
+   ```
+
+### RRC GIS Viewer (Comprehensive)
+
+For wells not covered by the above sources, the RRC GIS Viewer has coordinates for virtually all Texas wells. This requires:
+1. An **EWA API ID** (internal RRC identifier, e.g. `31133330`)
+2. Selenium + Chrome
+
+The `production_downloader.py` pipeline automatically resolves EWA API IDs from lease numbers + districts. If you already have an API ID:
+
+```bash
+python3 api_latlon_lookup.py --rrc --api-id 31133330
+```
+
+If you only have lease number + district, use the full pipeline in `production_downloader.py` instead — it handles the EWA → GIS lookup chain automatically.
+
+---
+
 ## System Architecture
 
 ### Data Sources
@@ -378,6 +452,7 @@ Example: `4231116232605` = `42-311-162326-05`
 rrc-scraper/
 ├── lease_discovery.py            # Phase 1: Discover leases
 ├── production_downloader.py      # Phase 2: Download + enrichment
+├── api_latlon_lookup.py          # Standalone lat/lon lookup by API number
 ├── discover_all_leases.sh        # Shell wrapper for full discovery
 ├── RRCScraper.py                 # Original scraper (deprecated)
 ├── scrape.py                     # Original CLI wrapper (deprecated)
